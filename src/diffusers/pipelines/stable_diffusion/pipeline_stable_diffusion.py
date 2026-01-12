@@ -11,6 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# ===========================
+# [CoT-Guided Diffusion EXP]
+# Author: Han Cheng
+# Purpose: research prototype
+# Step 1: acquire the latent of each step and output the intermediated image.
+# ===========================
+
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -39,7 +47,9 @@ from ..pipeline_utils import DiffusionPipeline, StableDiffusionMixin
 from .pipeline_output import StableDiffusionPipelineOutput
 from .safety_checker import StableDiffusionSafetyChecker
 
-
+# new import
+from PIL import Image
+import os
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
 
@@ -804,6 +814,19 @@ class StableDiffusionPipeline(
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        
+
+        # ===========================
+        # new parameters for saving the intermediates latent.
+
+        # trigger
+        save_intermediates: bool = False,
+        # save folder name 
+        save_intermediates_dir: str = "intermediates",
+        # save every k steps
+        save_intermediates_every: int = 1,
+
+
         **kwargs,
     ):
         r"""
@@ -1023,6 +1046,10 @@ class StableDiffusionPipeline(
             timestep_cond = self.get_guidance_scale_embedding(
                 guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
+        
+        # new: trigger for saving the intermediate
+        if save_intermediates:
+            os.makedirs(save_intermediates_dir, exist_ok=True)
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -1059,6 +1086,33 @@ class StableDiffusionPipeline(
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                
+                # new: code for saving image using latent in designated steps
+                if save_intermediates and (i % save_intermediates_every == 0):
+                    with torch.no_grad():
+                        # transfer latent to VAE scale (required by SD)
+                        image_tensor = self.vae.decode(
+                            latents / self.vae.config.scaling_factor,
+                            return_dict=False
+                        )[0]
+
+                        # use image_processor.postprocess() to transfer latent to image as the comment in method decode_latent described
+                        pil_images = self.image_processor.postprocess(
+                            image_tensor,
+                            output_type="pil",
+                            do_denormalize=[True] * image_tensor.shape[0],
+                        )
+
+                    for b, im in enumerate(pil_images):
+                        im.save(
+                            os.path.join(
+                                save_intermediates_dir,
+                                f"step_{i:04d}_t_{int(t)}_b{b}.png"
+                            )
+                        )
+
+
+
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}

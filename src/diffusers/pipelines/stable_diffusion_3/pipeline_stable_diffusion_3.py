@@ -43,6 +43,9 @@ from ...utils.torch_utils import randn_tensor
 from ..pipeline_utils import DiffusionPipeline
 from .pipeline_output import StableDiffusion3PipelineOutput
 
+#  new import
+import os
+from PIL import Image
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -804,6 +807,13 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         skip_layer_guidance_scale: float = 2.8,
         skip_layer_guidance_stop: float = 0.2,
         skip_layer_guidance_start: float = 0.01,
+
+
+        # new parameters
+        save_intermediates: bool = False,
+        save_intermediates_dir: str = "sd3_intermediates",
+        save_intermediates_every: int = 1,
+
         mu: Optional[float] = None,
     ):
         r"""
@@ -1050,6 +1060,10 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             else:
                 self._joint_attention_kwargs.update(ip_adapter_image_embeds=ip_adapter_image_embeds)
 
+        # trigger for creating folder  
+        if save_intermediates:
+            os.makedirs(save_intermediates_dir, exist_ok=True)
+
         # 7. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -1099,6 +1113,32 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+
+                if save_intermediates and (i % save_intermediates_every == 0):
+                    with torch.no_grad():
+                        #scale + shift
+                        latents_for_decode = (
+                            latents / self.vae.config.scaling_factor
+                        ) + self.vae.config.shift_factor
+
+                        image_tensor = self.vae.decode(
+                            latents_for_decode,
+                            return_dict=False
+                        )[0]
+
+                        pil_images = self.image_processor.postprocess(
+                            image_tensor,
+                            output_type="pil"
+                        )
+
+                    for b, im in enumerate(pil_images):
+                        im.save(
+                            os.path.join(
+                                save_intermediates_dir,
+                                f"step_{i:04d}_t_{int(t)}_b{b}.png"
+                            )
+                        )
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
