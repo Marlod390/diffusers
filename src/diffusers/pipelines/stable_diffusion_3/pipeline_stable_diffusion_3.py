@@ -873,6 +873,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
 
         # new parameters
+        semantic_guidance_scale: float = 1.0,
         save_intermediates: bool = False,
         save_intermediates_dir: str = "sd3_intermediates",
         save_intermediates_every: int = 1,
@@ -885,6 +886,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         vlm_start_step: Optional[int] = None,
         vlm_every: int = 1,
         return_baseline: bool = False,
+        debug_vlm: bool = False,
 
         mu: Optional[float] = None,
     ):
@@ -1082,6 +1084,11 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             lora_scale=lora_scale,
         )
 
+        # baseline negatives never change
+        baseline_negative_prompt_embeds = negative_prompt_embeds
+        baseline_negative_pooled_prompt_embeds = negative_pooled_prompt_embeds
+
+        # guided negatives may be updated by VLM
         current_negative_prompt_embeds = negative_prompt_embeds
         current_negative_pooled_prompt_embeds = negative_pooled_prompt_embeds
         current_vlm_negative_text: Optional[str] = None
@@ -1103,6 +1110,16 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             generator,
             latents,
         )
+
+        # ======================
+        # Dual-track latents (baseline vs guided)
+        # ======================
+        if return_baseline:
+            latents_base = latents.clone()
+            latents_guided = latents.clone()
+        else:
+            latents_base = None
+            latents_guided = latents
 
         # 5. Prepare timesteps
         scheduler_kwargs = {}
@@ -1131,6 +1148,14 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
+        # ======================
+        # Duplicate scheduler for baseline track
+        # ======================
+        if return_baseline:
+            import copy
+            scheduler_base = copy.deepcopy(self.scheduler)
+        else:
+            scheduler_base = None
 
         # ======================
         # VLM step scheduling
@@ -1167,69 +1192,159 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
 
                 # ======================
-                # (A) Build conditional batch (neg + pos) dynamically
+                                # ======================
+                # (A) Build conditional batch (baseline + guided)
                 # ======================
-                if self.do_classifier_free_guidance:
-                    # concatenate encoder states each step because negative embeds may be updated by VLM
-                    encoder_hidden_states = torch.cat([current_negative_prompt_embeds, prompt_embeds], dim=0)
-                    pooled_projections = torch.cat([current_negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+                if return_baseline:
+                    # latents: two tracks
+                    lb = latents_base
+                    lg = latents_guided
 
-                    latent_model_input = torch.cat([latents] * 2)
+                    if self.do_classifier_free_guidance:
+                        # batch: [base_uncond, base_text, guided_uncond, guided_text]
+                        latent_model_input = torch.cat([lb, lb, lg, lg], dim=0)
+
+                        encoder_hidden_states = torch.cat(
+                            [
+                                baseline_negative_prompt_embeds,  # base uncond
+                                prompt_embeds,                    # base cond
+                                current_negative_prompt_embeds,   # guided uncond
+                                prompt_embeds,                    # guided cond
+                            ],
+                            dim=0,
+                        )
+                        pooled_projections = torch.cat(
+                            [
+                                baseline_negative_pooled_prompt_embeds,
+                                pooled_prompt_embeds,
+                                current_negative_pooled_prompt_embeds,
+                                pooled_prompt_embeds,
+                            ],
+                            dim=0,
+                        )
+                    else:
+                        # no CFG -> just run two tracks as a batch of 2
+                        latent_model_input = torch.cat([lb, lg], dim=0)
+                        encoder_hidden_states = torch.cat([prompt_embeds, prompt_embeds], dim=0)
+                        pooled_projections = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+
                 else:
-                    encoder_hidden_states = prompt_embeds
-                    pooled_projections = pooled_prompt_embeds
-                    latent_model_input = latents
+                    # single guided track (your current behavior)
+                    if self.do_classifier_free_guidance:
+                        encoder_hidden_states = torch.cat([current_negative_prompt_embeds, prompt_embeds], dim=0)
+                        pooled_projections = torch.cat([current_negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+                        latent_model_input = torch.cat([latents_guided] * 2)
+                    else:
+                        encoder_hidden_states = prompt_embeds
+                        pooled_projections = pooled_prompt_embeds
+                        latent_model_input = latents_guided
 
-
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
+                    encoder_hidden_states=encoder_hidden_states,
+                    pooled_projections=pooled_projections,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
 
-                # perform guidance
-                if self.do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    should_skip_layers = (
-                        True
-                        if i > num_inference_steps * skip_layer_guidance_start
-                        and i < num_inference_steps * skip_layer_guidance_stop
-                        else False
-                    )
-                    if skip_guidance_layers is not None and should_skip_layers:
-                        timestep = t.expand(latents.shape[0])
-                        latent_model_input = latents
-                        noise_pred_skip_layers = self.transformer(
-                            hidden_states=latent_model_input,
-                            timestep=timestep,
-                            encoder_hidden_states=original_prompt_embeds,
-                            pooled_projections=original_pooled_prompt_embeds,
-                            joint_attention_kwargs=self.joint_attention_kwargs,
-                            return_dict=False,
-                            skip_layers=skip_guidance_layers,
-                        )[0]
-                        noise_pred = (
-                            noise_pred + (noise_pred_text - noise_pred_skip_layers) * self._skip_layer_guidance_scale
-                        )
+                # ======================
+                # (A2) Guidance + optional skip-layer guidance
+                # ======================
+                if return_baseline:
+                    if self.do_classifier_free_guidance:
+                        eps_b_u, eps_b_c, eps_g_u, eps_g_c = noise_pred.chunk(4)
+                        noise_pred_base = eps_b_u + self.guidance_scale * (eps_b_c - eps_b_u)
+                        noise_pred_guided = eps_g_u + self.guidance_scale * (eps_g_c - eps_g_u)
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                        # keep your skip-layer guidance behavior, apply to BOTH tracks
+                        should_skip_layers = (
+                            True
+                            if i > num_inference_steps * skip_layer_guidance_start
+                            and i < num_inference_steps * skip_layer_guidance_stop
+                            else False
+                        )
+                        if skip_guidance_layers is not None and should_skip_layers:
+                            # baseline skip-layers
+                            timestep_b = t.expand(latents_base.shape[0])
+                            noise_pred_skip_b = self.transformer(
+                                hidden_states=latents_base,
+                                timestep=timestep_b,
+                                encoder_hidden_states=original_prompt_embeds,
+                                pooled_projections=original_pooled_prompt_embeds,
+                                joint_attention_kwargs=self.joint_attention_kwargs,
+                                return_dict=False,
+                                skip_layers=skip_guidance_layers,
+                            )[0]
+                            noise_pred_base = noise_pred_base + (eps_b_c - noise_pred_skip_b) * self._skip_layer_guidance_scale
+
+                            # guided skip-layers
+                            timestep_g = t.expand(latents_guided.shape[0])
+                            noise_pred_skip_g = self.transformer(
+                                hidden_states=latents_guided,
+                                timestep=timestep_g,
+                                encoder_hidden_states=original_prompt_embeds,
+                                pooled_projections=original_pooled_prompt_embeds,
+                                joint_attention_kwargs=self.joint_attention_kwargs,
+                                return_dict=False,
+                                skip_layers=skip_guidance_layers,
+                            )[0]
+                            noise_pred_guided = noise_pred_guided + (eps_g_c - noise_pred_skip_g) * self._skip_layer_guidance_scale
+                    else:
+                        # no CFG: split two tracks
+                        noise_pred_base, noise_pred_guided = noise_pred.chunk(2)
+
+                    # scheduler step for both
+                    latents_dtype_b = latents_base.dtype
+                    latents_dtype_g = latents_guided.dtype
+
+                    latents_base = scheduler_base.step(
+                        noise_pred_base, t, latents_base, return_dict=False
+                    )[0]
+
+                    latents_guided = self.scheduler.step(
+                        noise_pred_guided, t, latents_guided, return_dict=False
+                    )[0]
+
+                else:
+                    # single guided track (your current behavior)
+                    if self.do_classifier_free_guidance:
+                        eps_u, eps_c = noise_pred.chunk(2)
+                        noise_pred_guided = eps_u + self.guidance_scale * (eps_c - eps_u)
+
+                        should_skip_layers = (
+                            True
+                            if i > num_inference_steps * skip_layer_guidance_start
+                            and i < num_inference_steps * skip_layer_guidance_stop
+                            else False
+                        )
+                        if skip_guidance_layers is not None and should_skip_layers:
+                            timestep_g = t.expand(latents_guided.shape[0])
+                            noise_pred_skip = self.transformer(
+                                hidden_states=latents_guided,
+                                timestep=timestep_g,
+                                encoder_hidden_states=original_prompt_embeds,
+                                pooled_projections=original_pooled_prompt_embeds,
+                                joint_attention_kwargs=self.joint_attention_kwargs,
+                                return_dict=False,
+                                skip_layers=skip_guidance_layers,
+                            )[0]
+                            noise_pred_guided = noise_pred_guided + (eps_c - noise_pred_skip) * self._skip_layer_guidance_scale
+                    else:
+                        noise_pred_guided = noise_pred
+
+                    latents_dtype_g = latents_guided.dtype
+                    latents_guided = self.scheduler.step(noise_pred_guided, t, latents_guided, return_dict=False)[0]
+
 
                 # ======================
                 # (B) VLM feedback: update negative prompt embeds
                 # ======================
                 if use_vlm_guidance and (vlm is not None) and (i >= vlm_start_step) and (i % vlm_every == 0):
                     with torch.no_grad():
-                        # decode current latents to PIL (batch)
-                        latents_for_decode = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                        latents_for_decode = (latents_guided / self.vae.config.scaling_factor) + self.vae.config.shift_factor
                         image_tensor = self.vae.decode(latents_for_decode, return_dict=False)[0]
                         pil_images = self.image_processor.postprocess(image_tensor, output_type="pil")
 
@@ -1238,7 +1353,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
                     # map to stable negative anchor text
                     neg_text = _vlm_json_to_negative_text(vlm_json, include_objects=True)
-                    print(f"[VLM] step={i} neg_text={neg_text}")
+                    if debug_vlm:
+                        print(f"[VLM] step={i} neg_text={neg_text}")
 
                     # update negative embeds only if the text actually changes
                     if neg_text is not None and neg_text != current_vlm_negative_text:
@@ -1267,10 +1383,10 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                         current_negative_pooled_prompt_embeds = new_negative_pooled_embeds
 
                 if save_intermediates and (i % save_intermediates_every == 0):
+                    # -------- guided track --------
                     with torch.no_grad():
-                        #scale + shift
                         latents_for_decode = (
-                            latents / self.vae.config.scaling_factor
+                            latents_guided / self.vae.config.scaling_factor
                         ) + self.vae.config.shift_factor
 
                         image_tensor = self.vae.decode(
@@ -1287,14 +1403,35 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                         im.save(
                             os.path.join(
                                 save_intermediates_dir,
-                                f"step_{i:04d}_t_{int(t)}_b{b}.png"
+                                f"guided_step_{i:04d}_t_{int(t)}_b{b}.png"
                             )
                         )
+                    # -------- baseline track (optional) --------
+                    if return_baseline:
+                        with torch.no_grad():
+                            latents_for_decode_b = (
+                                latents_base / self.vae.config.scaling_factor
+                            ) + self.vae.config.shift_factor
 
-                if latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
-                        latents = latents.to(latents_dtype)
+                            image_tensor_b = self.vae.decode(
+                                latents_for_decode_b,
+                                return_dict=False
+                            )[0]
+
+                            pil_images_b = self.image_processor.postprocess(
+                                image_tensor_b,
+                                output_type="pil"
+                            )
+
+                        for b, im in enumerate(pil_images_b):
+                            im.save(
+                                os.path.join(
+                                    save_intermediates_dir,
+                                    f"base_step_{i:04d}_t_{int(t)}_b{b}.png"
+                                )
+                            )
+
+
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1314,18 +1451,32 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                     xm.mark_step()
 
         if output_type == "latent":
-            image = latents
-
+            image_guided = latents_guided
+            image_base = latents_base if return_baseline else None
         else:
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            # guided
+            lg = (latents_guided / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            image_guided = self.vae.decode(lg, return_dict=False)[0]
+            image_guided = self.image_processor.postprocess(image_guided, output_type=output_type)
 
-            image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
-
+            # baseline (optional)
+            if return_baseline:
+                lb = (latents_base / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                image_base = self.vae.decode(lb, return_dict=False)[0]
+                image_base = self.image_processor.postprocess(image_base, output_type=output_type)
+            else:
+                image_base = None
         # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
-            return (image,)
+            if return_baseline:
+                return (image_guided, image_base)
+            return (image_guided,)
 
-        return StableDiffusion3PipelineOutput(images=image)
+        if return_baseline:
+            # StableDiffusion3PipelineOutput 默认只有 images 字段，
+            # 为避免改 diffusers dataclass，这里直接返回 dict（最稳）
+            return {"images": image_guided, "images_baseline": image_base}
+
+        return StableDiffusion3PipelineOutput(images=image_guided)
