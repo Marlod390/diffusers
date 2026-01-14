@@ -1475,8 +1475,6 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             return (image_guided,)
 
         if return_baseline:
-            # StableDiffusion3PipelineOutput 默认只有 images 字段，
-            # 为避免改 diffusers dataclass，这里直接返回 dict（最稳）
             return {"images": image_guided, "images_baseline": image_base}
 
         return StableDiffusion3PipelineOutput(images=image_guided)
