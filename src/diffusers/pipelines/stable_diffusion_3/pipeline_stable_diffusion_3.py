@@ -14,6 +14,14 @@
 
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
+import sys
+import os
+_PROJECT_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "../../../../..")
+)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 
 import torch
 from transformers import (
@@ -24,6 +32,12 @@ from transformers import (
     T5EncoderModel,
     T5TokenizerFast,
 )
+# import internvl
+try:
+    from InternVL.internvl_feedback import InternVL3Feedback
+except ImportError:
+    InternVL3Feedback = None
+
 
 from ...callbacks import MultiPipelineCallbacks, PipelineCallback
 from ...image_processor import PipelineImageInput, VaeImageProcessor
@@ -46,6 +60,55 @@ from .pipeline_output import StableDiffusion3PipelineOutput
 #  new import
 import os
 from PIL import Image
+
+# VLM feedback -> negative anchor text
+_CODE_TO_ANCHOR = {
+    "OBJECT_FUSION": "object fusion",
+    "OBJECT_INTERNAL": "malformed object",
+    "EXTRA_PART": "extra limb",
+    "MISSING_PART": "missing part",
+    "STRUCTURAL": "broken structure",
+}
+
+def _vlm_json_to_negative_text(vlm_json: Dict[str, Any], include_objects: bool = True) -> Optional[str]:
+    """
+    Convert InternVL feedback JSON into a short, stable negative text signal.
+    We intentionally ignore free-form descriptions and use only discrete codes.
+    """
+    if not vlm_json or "anomalies" not in vlm_json:
+        return None
+
+    anomalies = vlm_json.get("anomalies", [])
+    if not isinstance(anomalies, list) or len(anomalies) == 0:
+        return None
+
+    parts: List[str] = []
+    for a in anomalies:
+        if not isinstance(a, dict):
+            continue
+        code = a.get("code", None)
+        if code not in _CODE_TO_ANCHOR:
+            continue
+
+        anchor = _CODE_TO_ANCHOR[code]
+        objs = a.get("objects", [])
+        if include_objects and isinstance(objs, list) and len(objs) > 0:
+            # weak localization via object tokens (no grammar)
+            token_str = " ".join([str(x) for x in objs if x is not None])
+            if token_str.strip():
+                parts.append(f"{anchor} {token_str}")
+            else:
+                parts.append(anchor)
+        else:
+            parts.append(anchor)
+
+    if len(parts) == 0:
+        return None
+
+    # Multiple anomalies -> comma-separated short anchors
+    return ", ".join(parts)
+
+
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
@@ -814,6 +877,15 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         save_intermediates_dir: str = "sd3_intermediates",
         save_intermediates_every: int = 1,
 
+        # ======================
+        # VLM-guided generation
+        # ======================
+        use_vlm_guidance: bool = False,
+        vlm_model_dir: str = "OpenGVLab/InternVL3-8B",
+        vlm_start_step: Optional[int] = None,
+        vlm_every: int = 1,
+        return_baseline: bool = False,
+
         mu: Optional[float] = None,
     ):
         r"""
@@ -961,6 +1033,18 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         self._joint_attention_kwargs = joint_attention_kwargs
         self._interrupt = False
 
+        # Initialize VLM (if enabled)
+        if use_vlm_guidance:
+            if InternVL3Feedback is None:
+                raise ImportError(
+                    "InternVL3Feedback could not be imported. "
+                )
+
+            # Lazy init: only once per pipeline call
+            vlm = InternVL3Feedback(model_dir=vlm_model_dir)
+        else:
+            vlm = None
+
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -998,12 +1082,14 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
             lora_scale=lora_scale,
         )
 
+        current_negative_prompt_embeds = negative_prompt_embeds
+        current_negative_pooled_prompt_embeds = negative_pooled_prompt_embeds
+        current_vlm_negative_text: Optional[str] = None
+
         if self.do_classifier_free_guidance:
             if skip_guidance_layers is not None:
                 original_prompt_embeds = prompt_embeds
                 original_pooled_prompt_embeds = pooled_prompt_embeds
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
@@ -1045,6 +1131,15 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
 
+
+        # ======================
+        # VLM step scheduling
+        # ======================
+        if use_vlm_guidance:
+            if vlm_start_step is None:
+                # start when coarse semantics usually emerge
+                vlm_start_step = int(0.55 * num_inference_steps)  # ~15 for 28 steps
+
         # 6. Prepare image embeddings
         if (ip_adapter_image is not None and self.is_ip_adapter_active) or ip_adapter_image_embeds is not None:
             ip_adapter_image_embeds = self.prepare_ip_adapter_image_embeds(
@@ -1070,8 +1165,22 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 if self.interrupt:
                     continue
 
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
+
+                # ======================
+                # (A) Build conditional batch (neg + pos) dynamically
+                # ======================
+                if self.do_classifier_free_guidance:
+                    # concatenate encoder states each step because negative embeds may be updated by VLM
+                    encoder_hidden_states = torch.cat([current_negative_prompt_embeds, prompt_embeds], dim=0)
+                    pooled_projections = torch.cat([current_negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+
+                    latent_model_input = torch.cat([latents] * 2)
+                else:
+                    encoder_hidden_states = prompt_embeds
+                    pooled_projections = pooled_prompt_embeds
+                    latent_model_input = latents
+
+
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                 timestep = t.expand(latent_model_input.shape[0])
 
@@ -1114,6 +1223,48 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
+                # ======================
+                # (B) VLM feedback: update negative prompt embeds
+                # ======================
+                if use_vlm_guidance and (vlm is not None) and (i >= vlm_start_step) and (i % vlm_every == 0):
+                    with torch.no_grad():
+                        # decode current latents to PIL (batch)
+                        latents_for_decode = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+                        image_tensor = self.vae.decode(latents_for_decode, return_dict=False)[0]
+                        pil_images = self.image_processor.postprocess(image_tensor, output_type="pil")
+
+                    # run VLM on the first image for now (MVP)
+                    vlm_json = vlm.infer(pil_images[0])
+
+                    # map to stable negative anchor text
+                    neg_text = _vlm_json_to_negative_text(vlm_json, include_objects=True)
+                    print(f"[VLM] step={i} neg_text={neg_text}")
+
+                    # update negative embeds only if the text actually changes
+                    if neg_text is not None and neg_text != current_vlm_negative_text:
+                        current_vlm_negative_text = neg_text
+
+                        # Encode ONLY negative prompt; keep positive prompt embeds unchanged.
+                        # We call encode_prompt with prompt_embeds/pooled passed in to avoid recomputing positives.
+                        _, new_negative_prompt_embeds, _, new_negative_pooled_embeds = self.encode_prompt(
+                            prompt=prompt,  # unused because prompt_embeds provided, but keeps API consistent
+                            prompt_2=prompt_2,
+                            prompt_3=prompt_3,
+                            negative_prompt=neg_text,
+                            negative_prompt_2=neg_text,
+                            negative_prompt_3=neg_text,
+                            do_classifier_free_guidance=True,
+                            prompt_embeds=prompt_embeds,
+                            pooled_prompt_embeds=pooled_prompt_embeds,
+                            device=device,
+                            clip_skip=self.clip_skip,
+                            num_images_per_prompt=num_images_per_prompt,
+                            max_sequence_length=max_sequence_length,
+                            lora_scale=lora_scale,
+                        )
+
+                        current_negative_prompt_embeds = new_negative_prompt_embeds
+                        current_negative_pooled_prompt_embeds = new_negative_pooled_embeds
 
                 if save_intermediates and (i % save_intermediates_every == 0):
                     with torch.no_grad():
