@@ -873,7 +873,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
 
         # new parameters
-        semantic_guidance_scale: float = 1.0,
+        semantic_guidance_scale: float = 10.0,
         save_intermediates: bool = False,
         save_intermediates_dir: str = "sd3_intermediates",
         save_intermediates_every: int = 1,
@@ -1092,6 +1092,8 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         current_negative_prompt_embeds = negative_prompt_embeds
         current_negative_pooled_prompt_embeds = negative_pooled_prompt_embeds
         current_vlm_negative_text: Optional[str] = None
+        has_vlm_feedback: bool = False 
+        
 
         if self.do_classifier_free_guidance:
             if skip_guidance_layers is not None:
@@ -1192,24 +1194,57 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
 
                 # ======================
-                                # ======================
                 # (A) Build conditional batch (baseline + guided)
                 # ======================
+
+                gamma = semantic_guidance_scale 
+                gamma_eff = gamma if (use_vlm_guidance and has_vlm_feedback) else 0.0
+
                 if return_baseline:
-                    # latents: two tracks
                     lb = latents_base
                     lg = latents_guided
 
                     if self.do_classifier_free_guidance:
-                        # batch: [base_uncond, base_text, guided_uncond, guided_text]
-                        latent_model_input = torch.cat([lb, lb, lg, lg], dim=0)
+                        # baseline needs: [u, c]
+                        # guided needs:   [u, c, n]   (u=baseline_negative, n=vlm_negative)
+                        latent_model_input = torch.cat([lb, lb, lg, lg, lg], dim=0)
 
                         encoder_hidden_states = torch.cat(
                             [
-                                baseline_negative_prompt_embeds,  # base uncond
-                                prompt_embeds,                    # base cond
-                                current_negative_prompt_embeds,   # guided uncond
-                                prompt_embeds,                    # guided cond
+                                baseline_negative_prompt_embeds,  # base u
+                                prompt_embeds,                    # base c
+                                baseline_negative_prompt_embeds,  # guided u 
+                                prompt_embeds,                    # guided c
+                                current_negative_prompt_embeds,   # guided n  (VLM negative)
+                            ],
+                            dim=0,
+                        )
+                        pooled_projections = torch.cat(
+                            [
+                                baseline_negative_pooled_prompt_embeds,
+                                pooled_prompt_embeds,
+                                baseline_negative_pooled_prompt_embeds,
+                                pooled_prompt_embeds,
+                                current_negative_pooled_prompt_embeds,
+                            ],
+                            dim=0,
+                        )
+                    else:
+                        # no CFG: baseline/guided just cond
+                        latent_model_input = torch.cat([lb, lg], dim=0)
+                        encoder_hidden_states = torch.cat([prompt_embeds, prompt_embeds], dim=0)
+                        pooled_projections = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+
+                else:
+                    # only guided track
+                    if self.do_classifier_free_guidance:
+                        # guided needs: [u, c, n]
+                        latent_model_input = torch.cat([latents_guided, latents_guided, latents_guided], dim=0)
+                        encoder_hidden_states = torch.cat(
+                            [
+                                baseline_negative_prompt_embeds,  # guided u (true uncond)
+                                prompt_embeds,                    # guided c
+                                current_negative_prompt_embeds,   # guided n (VLM neg)
                             ],
                             dim=0,
                         )
@@ -1218,26 +1253,13 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                                 baseline_negative_pooled_prompt_embeds,
                                 pooled_prompt_embeds,
                                 current_negative_pooled_prompt_embeds,
-                                pooled_prompt_embeds,
                             ],
                             dim=0,
                         )
                     else:
-                        # no CFG -> just run two tracks as a batch of 2
-                        latent_model_input = torch.cat([lb, lg], dim=0)
-                        encoder_hidden_states = torch.cat([prompt_embeds, prompt_embeds], dim=0)
-                        pooled_projections = torch.cat([pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
-
-                else:
-                    # single guided track (your current behavior)
-                    if self.do_classifier_free_guidance:
-                        encoder_hidden_states = torch.cat([current_negative_prompt_embeds, prompt_embeds], dim=0)
-                        pooled_projections = torch.cat([current_negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
-                        latent_model_input = torch.cat([latents_guided] * 2)
-                    else:
+                        latent_model_input = latents_guided
                         encoder_hidden_states = prompt_embeds
                         pooled_projections = pooled_prompt_embeds
-                        latent_model_input = latents_guided
 
                 timestep = t.expand(latent_model_input.shape[0])
 
@@ -1255,11 +1277,17 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 # ======================
                 if return_baseline:
                     if self.do_classifier_free_guidance:
-                        eps_b_u, eps_b_c, eps_g_u, eps_g_c = noise_pred.chunk(4)
-                        noise_pred_base = eps_b_u + self.guidance_scale * (eps_b_c - eps_b_u)
-                        noise_pred_guided = eps_g_u + self.guidance_scale * (eps_g_c - eps_g_u)
+                        # unpack: base(u,c), guided(u,c,n)
+                        eps_b_u, eps_b_c, eps_g_u, eps_g_c, eps_g_n = noise_pred.chunk(5)
 
-                        # keep your skip-layer guidance behavior, apply to BOTH tracks
+                        # baseline: standard CFG
+                        noise_pred_base = eps_b_u + self.guidance_scale * (eps_b_c - eps_b_u)
+
+                        # guided: Eq(3)
+                        # eps_final = eps_u + s(eps_c - eps_u) - γ(eps_n - eps_c)
+                        noise_pred_guided = eps_g_u + self.guidance_scale * (eps_g_c - eps_g_u) - gamma_eff * (eps_g_n - eps_g_c)
+
+                        # optional skip-layer guidance
                         should_skip_layers = (
                             True
                             if i > num_inference_steps * skip_layer_guidance_start
@@ -1292,27 +1320,19 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                                 skip_layers=skip_guidance_layers,
                             )[0]
                             noise_pred_guided = noise_pred_guided + (eps_g_c - noise_pred_skip_g) * self._skip_layer_guidance_scale
+
                     else:
                         # no CFG: split two tracks
                         noise_pred_base, noise_pred_guided = noise_pred.chunk(2)
 
-                    # scheduler step for both
-                    latents_dtype_b = latents_base.dtype
-                    latents_dtype_g = latents_guided.dtype
-
-                    latents_base = scheduler_base.step(
-                        noise_pred_base, t, latents_base, return_dict=False
-                    )[0]
-
-                    latents_guided = self.scheduler.step(
-                        noise_pred_guided, t, latents_guided, return_dict=False
-                    )[0]
+                    # scheduler step for both tracks
+                    latents_base = scheduler_base.step(noise_pred_base, t, latents_base, return_dict=False)[0]
+                    latents_guided = self.scheduler.step(noise_pred_guided, t, latents_guided, return_dict=False)[0]
 
                 else:
-                    # single guided track (your current behavior)
                     if self.do_classifier_free_guidance:
-                        eps_u, eps_c = noise_pred.chunk(2)
-                        noise_pred_guided = eps_u + self.guidance_scale * (eps_c - eps_u)
+                        eps_u, eps_c, eps_n = noise_pred.chunk(3)
+                        noise_pred_guided = eps_u + self.guidance_scale * (eps_c - eps_u) - gamma_eff * (eps_n - eps_c)
 
                         should_skip_layers = (
                             True
@@ -1335,8 +1355,9 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                     else:
                         noise_pred_guided = noise_pred
 
-                    latents_dtype_g = latents_guided.dtype
                     latents_guided = self.scheduler.step(noise_pred_guided, t, latents_guided, return_dict=False)[0]
+
+                latents = latents_guided
 
 
                 # ======================
@@ -1381,6 +1402,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
                         current_negative_prompt_embeds = new_negative_prompt_embeds
                         current_negative_pooled_prompt_embeds = new_negative_pooled_embeds
+                        has_vlm_feedback = True
 
                 if save_intermediates and (i % save_intermediates_every == 0):
                     # -------- guided track --------
