@@ -70,43 +70,46 @@ _CODE_TO_ANCHOR = {
     "STRUCTURAL": "broken structure",
 }
 
-def _vlm_json_to_negative_text(vlm_json: Dict[str, Any], include_objects: bool = True) -> Optional[str]:
-    """
-    Convert InternVL feedback JSON into a short, stable negative text signal.
-    We intentionally ignore free-form descriptions and use only discrete codes.
-    """
+def _vlm_json_to_negative_text_nl(vlm_json):
     if not vlm_json or "anomalies" not in vlm_json:
         return None
 
-    anomalies = vlm_json.get("anomalies", [])
-    if not isinstance(anomalies, list) or len(anomalies) == 0:
-        return None
+    sentences = []
 
-    parts: List[str] = []
-    for a in anomalies:
-        if not isinstance(a, dict):
-            continue
-        code = a.get("code", None)
-        if code not in _CODE_TO_ANCHOR:
-            continue
-
-        anchor = _CODE_TO_ANCHOR[code]
+    for a in vlm_json["anomalies"]:
+        code = a.get("code")
         objs = a.get("objects", [])
-        if include_objects and isinstance(objs, list) and len(objs) > 0:
-            # weak localization via object tokens (no grammar)
-            token_str = " ".join([str(x) for x in objs if x is not None])
-            if token_str.strip():
-                parts.append(f"{anchor} {token_str}")
-            else:
-                parts.append(anchor)
-        else:
-            parts.append(anchor)
 
-    if len(parts) == 0:
+        if code == "OBJECT_FUSION" and len(objs) >= 2:
+            sentences.append(
+                f"The {objs[0]} is incorrectly fused with The {objs[1]}"
+            )
+
+        elif code == "EXTRA_PART" and len(objs) >= 1:
+            sentences.append(
+                f"The {objs[0]} has extra or duplicated body parts"
+            )
+
+        elif code == "MISSING_PART" and len(objs) >= 1:
+            sentences.append(
+                f"The {objs[0]} is missing essential body parts"
+            )
+
+        elif code == "OBJECT_INTERNAL" and len(objs) >= 1:
+            sentences.append(
+                f"The {objs[0]} has an anatomically incorrect internal structure"
+            )
+
+        elif code == "STRUCTURAL":
+            sentences.append(
+                "the object structure is severely broken and invalid"
+            )
+
+    if not sentences:
         return None
 
-    # Multiple anomalies -> comma-separated short anchors
-    return ", ".join(parts)
+    return ". ".join(sentences)
+
 
 
 
@@ -873,10 +876,12 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
 
         # new parameters
-        semantic_guidance_scale: float = 10.0,
+        semantic_guidance_scale: float = 7,
         save_intermediates: bool = False,
         save_intermediates_dir: str = "sd3_intermediates",
         save_intermediates_every: int = 1,
+        save_x0_predictions: bool = False,
+        save_x0_dir: str = "x0_predictions",
 
         # ======================
         # VLM-guided generation
@@ -1165,7 +1170,7 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         if use_vlm_guidance:
             if vlm_start_step is None:
                 # start when coarse semantics usually emerge
-                vlm_start_step = int(0.55 * num_inference_steps)  # ~15 for 28 steps
+                vlm_start_step = int(0.15 * num_inference_steps)  # ~15 for 28 steps
 
         # 6. Prepare image embeddings
         if (ip_adapter_image is not None and self.is_ip_adapter_active) or ip_adapter_image_embeds is not None:
@@ -1185,12 +1190,16 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
         # trigger for creating folder  
         if save_intermediates:
             os.makedirs(save_intermediates_dir, exist_ok=True)
+        if save_x0_predictions:
+            os.makedirs(save_x0_dir, exist_ok=True)
 
         # 7. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
+
+                x0_hat_for_vlm = None
 
 
                 # ======================
@@ -1271,6 +1280,52 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
                 )[0]
+
+                # ======================================================
+                # caculate x0hat
+                # ======================================================
+                if save_x0_predictions and self.do_classifier_free_guidance:
+                    with torch.no_grad():
+
+                        
+                        if return_baseline:
+                            # unpack: eps_b_u, eps_b_c, eps_g_u, eps_g_c, eps_g_n
+                            _, _, eps_u_g, eps_c_g, _ = noise_pred.chunk(5)
+                            eps_u = eps_u_g
+                            eps_c = eps_c_g
+                        else:
+                            # normal case: [u, c, n]
+                            eps_u, eps_c, _ = noise_pred.chunk(3)
+
+                        #  CFG 
+                        eps_cfg = eps_u + self.guidance_scale * (eps_c - eps_u)
+
+                        # Use sigma from FlowMatch to calculate x0_hat
+                        step_index = (self.scheduler.timesteps == t).nonzero(as_tuple=True)[0].item()
+                        sigma_t = self.scheduler.sigmas[step_index]
+                        x0_hat = latents_guided - sigma_t * eps_cfg
+                        x0_hat_for_vlm = x0_hat
+
+                        # --- 2.4 decode & save ---
+                        latents_for_decode = (
+                            x0_hat / self.vae.config.scaling_factor
+                        ) + self.vae.config.shift_factor
+
+                        image_tensor = self.vae.decode(
+                            latents_for_decode, return_dict=False
+                        )[0]
+
+                        pil_images = self.image_processor.postprocess(
+                            image_tensor, output_type="pil"
+                        )
+
+                        for b, im in enumerate(pil_images):
+                            im.save(
+                                os.path.join(
+                                    save_x0_dir,
+                                    f"x0_hat_step_{i:04d}_t_{int(t)}_b{b}.png"
+                                )
+                            )
 
                 # ======================
                 # (A2) Guidance + optional skip-layer guidance
@@ -1365,15 +1420,30 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
                 # ======================
                 if use_vlm_guidance and (vlm is not None) and (i >= vlm_start_step) and (i % vlm_every == 0):
                     with torch.no_grad():
-                        latents_for_decode = (latents_guided / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-                        image_tensor = self.vae.decode(latents_for_decode, return_dict=False)[0]
-                        pil_images = self.image_processor.postprocess(image_tensor, output_type="pil")
+                        # x0_hat as input 
+                        if (i >= 4) and (x0_hat_for_vlm is not None):
+                            latents_for_decode = (
+                                x0_hat_for_vlm / self.vae.config.scaling_factor
+                            ) + self.vae.config.shift_factor
+                        else:
+                            # fallback：前几步仍用原始 latent
+                            latents_for_decode = (
+                                latents_guided / self.vae.config.scaling_factor
+                            ) + self.vae.config.shift_factor
+
+                        image_tensor = self.vae.decode(
+                            latents_for_decode, return_dict=False
+                        )[0]
+
+                        pil_images = self.image_processor.postprocess(
+                            image_tensor, output_type="pil"
+                        )
 
                     # run VLM on the first image for now (MVP)
                     vlm_json = vlm.infer(pil_images[0])
 
                     # map to stable negative anchor text
-                    neg_text = _vlm_json_to_negative_text(vlm_json, include_objects=True)
+                    neg_text = _vlm_json_to_negative_text_nl(vlm_json)
                     if debug_vlm:
                         print(f"[VLM] step={i} neg_text={neg_text}")
 
